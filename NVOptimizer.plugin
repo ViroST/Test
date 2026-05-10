@@ -1,0 +1,560 @@
+__id__ = "NVOp"
+__name__ = "NVOptimizer"
+__description__ = "Мониторинг и оптимизация плагинов с авто-отключением лагающих."
+__author__ = "@ShiroMzS"
+__version__ = "1"
+__icon__ = "pulseplugin/0"
+__min_version__ = "12.5.1"
+
+from base_plugin import BasePlugin, MethodHook, AppEvent
+from android_utils import run_on_ui_thread
+from hook_utils import find_class, get_private_field
+from java.lang import Runtime, System
+from ui.bulletin import BulletinHelper
+from ui.settings import Header, Switch, Divider, Text
+from ui.alert import AlertDialogBuilder
+from client_utils import get_last_fragment
+
+# Добавлены импорты для Handler
+from android.os import Handler, Looper
+
+import time
+import threading
+
+_CHATACTIVITY_CLASS = "org.telegram.ui.ChatActivity"
+_HOOK_PRIORITY = 920
+
+
+class _ChatCreateViewHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            if not self.plugin._engine_active:
+                return
+            chat_list_view = self.plugin._resolve_chat_list_view(param.thisObject)
+            if chat_list_view is None:
+                return
+
+            effective_cache = self.plugin._effective_item_view_cache_target()
+            current_cache = int(chat_list_view.getItemViewCacheSize())
+            if current_cache != effective_cache:
+                chat_list_view.setItemViewCacheSize(effective_cache)
+                now = int(System.currentTimeMillis())
+                self.plugin._last_opt_time_ms = now
+                self.plugin._optimization_count += 1
+                heap_pct = int(self.plugin._heap_ratio_sample() * 100)
+                self.plugin._last_opt_msg = (
+                    f"Cache: {current_cache} -> {effective_cache} (memory {heap_pct}%)"
+                )
+                self.plugin._add_log(self.plugin._last_opt_msg)
+        except Exception as e:
+            self.plugin.log("Chat list optimization skipped: " + str(e))
+
+
+class _PluginRunBeforeHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            param._start_ns = System.nanoTime()
+        except:
+            pass
+
+
+class _PluginRunAfterHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            start_ns = getattr(param, '_start_ns', None)
+            if start_ns is None:
+                return
+
+            elapsed = (System.nanoTime() - start_ns) / 1_000_000
+
+            plugin_name = "unknown"
+            if len(param.args) > 0 and hasattr(param.args[0], 'name'):
+                plugin_name = str(param.args[0].name)
+            elif hasattr(param, 'plugin_name'):
+                plugin_name = str(param.plugin_name)
+
+            self.plugin._track_plugin(plugin_name, elapsed)
+
+            if self.plugin.get_setting("auto_optimize"):
+                threshold = self.plugin.get_setting("auto_disable_ms", 80)
+                if elapsed > threshold:
+                    # Запускаем отключение в отдельном потоке, не блокируя хук
+                    threading.Thread(
+                        target=self.plugin._auto_disable_plugin,
+                        args=(plugin_name,),
+                        daemon=True
+                    ).start()
+        except Exception as e:
+            self.plugin.log("Plugin profiler error: " + str(e))
+
+
+class SmartOptimizerPlugin(BasePlugin):
+    THRESHOLD_OPTIONS_LAG = [5, 8, 10, 12, 16, 20, 25, 33, 40, 50]
+    THRESHOLD_OPTIONS_WARN = [10, 15, 20, 25, 33, 40, 50, 60, 80, 100]
+    THRESHOLD_OPTIONS_AUTO = [30, 40, 50, 60, 80, 100, 120, 150, 200]
+
+    def __init__(self):
+        super().__init__()
+        self._loaded = False
+        self._chat_create_view_unhooks = []
+        self._plugin_profiler_unhooks = []
+        self._engine_initialized = False
+        self._engine_active = False
+        self._selected_cache_size = 20
+        self._last_opt_time_ms = 0
+        self._last_opt_msg = "---"
+        self._last_heap_sample_ms = 0
+        self._cached_heap_ratio = 0.0
+        self._heap_sample_ttl_ms = 750
+        self._log_events = []
+        self._log_max_entries = 100
+        self._optimization_count = 0
+
+        self._plugin_stats = {}
+        self._fps_drops = 0
+        self._fps_current = 60
+        self._fps_monitor_active = False
+        # FPS монитор через Handler
+        self._fps_handler = Handler(Looper.getMainLooper())
+        self._fps_runnable = None
+
+        defaults = {
+            "lag_threshold_ms": 16,
+            "warn_threshold_ms": 33,
+            "auto_disable_ms": 80,
+            "toast_on_lag": True,
+            "auto_optimize": False,
+            "fps_monitor": True,
+        }
+        for key, value in defaults.items():
+            if self.get_setting(key) is None:
+                self.set_setting(key, value)
+
+    def on_plugin_load(self):
+        if self._loaded:
+            self.on_plugin_unload()
+        self._loaded = True
+
+        self._cleanup_hooks()
+        self._engine_active = True
+        self._install_plugin_profiler()
+        # Хук чата устанавливается не по таймеру, а при первом создании ChatActivity
+        # Но для надёжности всё равно попробуем инициализировать сразу (он отложится до появления Activity)
+        self._install_chat_hook()
+
+    def on_plugin_unload(self):
+        self._loaded = False
+        self._engine_active = False
+        self._stop_fps_monitor()
+        self._cleanup_hooks()
+        self._engine_initialized = False
+
+    def _cleanup_hooks(self):
+        for unhook_list in [self._chat_create_view_unhooks, self._plugin_profiler_unhooks]:
+            for unhook in unhook_list:
+                try:
+                    self.unhook_method(unhook)
+                except Exception:
+                    pass
+        self._chat_create_view_unhooks.clear()
+        self._plugin_profiler_unhooks.clear()
+
+    def on_app_event(self, event_type: AppEvent):
+        # При старте приложения повторно пытаемся установить хук
+        if event_type in (AppEvent.START, AppEvent.RESUME):
+            if not self._chat_create_view_unhooks:
+                self._install_chat_hook()
+
+    # ------------------------------------------------------------
+    # Профилировщик плагинов
+    # ------------------------------------------------------------
+    def _install_plugin_profiler(self):
+        if self._plugin_profiler_unhooks:
+            return
+        try:
+            plugin_manager = find_class("com.exteragram.messenger.plugins.PluginManager")
+            if not plugin_manager:
+                return
+
+            hooks = self.hook_all_methods(
+                plugin_manager,
+                "runPlugin",
+                _PluginRunBeforeHook(self),
+                _PluginRunAfterHook(self),
+                priority=800
+            )
+            if hooks:
+                self._plugin_profiler_unhooks = list(hooks)
+                self._add_log("Profiler installed")
+        except Exception as e:
+            self.log("Plugin profiler install error: " + str(e))
+
+    def _track_plugin(self, name: str, time_ms: float):
+        if name not in self._plugin_stats:
+            self._plugin_stats[name] = {"calls": 0, "total": 0.0, "max": 0.0}
+        p = self._plugin_stats[name]
+        p["calls"] += 1
+        p["total"] += time_ms
+        p["max"] = max(p["max"], time_ms)
+
+        warn_threshold = self.get_setting("warn_threshold_ms", 33)
+        if time_ms > warn_threshold:
+            self._add_log(f"{name} lag: {time_ms:.2f}ms")
+            if self.get_setting("toast_on_lag"):
+                run_on_ui_thread(
+                    lambda: BulletinHelper.show_warning(f"{name}: {time_ms:.1f}ms", self._bulletin_fragment())
+                )
+
+    def _auto_disable_plugin(self, name: str):
+        # Не отключаем самого себя
+        if name == self.__name__ or name == "SmartOptimizer":
+            return
+        try:
+            pm_class = find_class("com.exteragram.messenger.plugins.PluginManager")
+            if pm_class and hasattr(pm_class, "disable"):
+                pm_class.disable(name)
+                self._add_log(f"🚫 Disabled {name} (auto-optimize)")
+                run_on_ui_thread(
+                    lambda: BulletinHelper.show_error(f"{name} отключён из-за лагов", self._bulletin_fragment())
+                )
+        except Exception as e:
+            self.log(f"Auto-disable error: {e}")
+
+    # ------------------------------------------------------------
+    # FPS монитор (исправлен)
+    # ------------------------------------------------------------
+    def _start_fps_monitor(self):
+        if self._fps_monitor_active or not self.get_setting("fps_monitor"):
+            return
+        self._fps_monitor_active = True
+        self._last_frame_ns = System.nanoTime()
+
+        def frame_check():
+            if not self._fps_monitor_active:
+                return
+            try:
+                now = System.nanoTime()
+                delta_ms = (now - self._last_frame_ns) / 1_000_000
+                self._last_frame_ns = now
+
+                if delta_ms > 50:
+                    self._fps_drops += 1
+                    self._add_log(f"FPS drop: {delta_ms:.1f}ms")
+
+                self._fps_current = int(1000.0 / max(delta_ms, 1.0))
+
+                # Планируем следующий замер
+                if self._fps_monitor_active:
+                    self._fps_handler.postDelayed(frame_check, 16)
+            except Exception:
+                self._fps_monitor_active = False
+
+        self._fps_runnable = frame_check
+        self._fps_handler.postDelayed(self._fps_runnable, 16)
+
+    def _stop_fps_monitor(self):
+        self._fps_monitor_active = False
+        if self._fps_runnable:
+            self._fps_handler.removeCallbacks(self._fps_runnable)
+            self._fps_runnable = None
+
+    # ------------------------------------------------------------
+    # Память и кэш
+    # ------------------------------------------------------------
+    def _heap_ratio_sample(self) -> float:
+        now = int(System.currentTimeMillis())
+        if self._last_heap_sample_ms > 0 and (now - self._last_heap_sample_ms) < self._heap_sample_ttl_ms:
+            return self._cached_heap_ratio
+        try:
+            runtime = Runtime.getRuntime()
+            max_mem = float(runtime.maxMemory())
+            if max_mem <= 0:
+                return self._cached_heap_ratio
+            used = float(runtime.totalMemory() - runtime.freeMemory())
+            r = used / max_mem
+            if r < 0.0: r = 0.0
+            elif r > 1.0: r = 1.0
+            self._cached_heap_ratio = r
+            self._last_heap_sample_ms = now
+            return r
+        except Exception:
+            return self._cached_heap_ratio
+
+    def _effective_item_view_cache_target(self) -> int:
+        heap = self._heap_ratio_sample()
+        if heap > 0.85: base = 10
+        elif heap > 0.70: base = 14
+        elif heap > 0.55: base = 18
+        else: base = 22
+        return max(8, min(base, 24))
+
+    def _get_memory_info_str(self):
+        try:
+            runtime = Runtime.getRuntime()
+            max_mem = runtime.maxMemory()
+            total = runtime.totalMemory()
+            free = runtime.freeMemory()
+            used = total - free
+            return f"{self._fmt_bytes(used)} / {self._fmt_bytes(total)} (max {self._fmt_bytes(max_mem)})"
+        except:
+            return "недоступно"
+
+    @staticmethod
+    def _fmt_bytes(n):
+        if n < 1024: return f"{n} B"
+        elif n < 1048576: return f"{n/1024:.1f} KB"
+        else: return f"{n/1048576:.1f} MB"
+
+    # ------------------------------------------------------------
+    # Установка хука чата (упрощён)
+    # ------------------------------------------------------------
+    def _install_chat_hook(self):
+        if self._chat_create_view_unhooks:
+            return
+        try:
+            chat_activity_class = find_class(_CHATACTIVITY_CLASS)
+            if not chat_activity_class:
+                return
+            unhooks = self.hook_all_methods(
+                chat_activity_class,
+                "createView",
+                _ChatCreateViewHook(self),
+                priority=_HOOK_PRIORITY,
+            )
+            if unhooks:
+                self._chat_create_view_unhooks = list(unhooks)
+                self._engine_initialized = True
+                self._add_log("Chat hook installed")
+                # Запускаем FPS монитор, как только хук установлен
+                self._start_fps_monitor()
+                run_on_ui_thread(
+                    lambda: BulletinHelper.show_success("SmartOptimizer запущен", self._bulletin_fragment())
+                )
+        except Exception as e:
+            self.log("Chat hook error: " + str(e))
+
+    def _resolve_chat_list_view(self, chat_activity):
+        def _looks_like_chat_list_view(v):
+            if v is None:
+                return False
+            try:
+                return (
+                    callable(getattr(v, "getItemViewCacheSize", None))
+                    and callable(getattr(v, "setItemViewCacheSize", None))
+                    and callable(getattr(v, "getChildCount", None))
+                    and callable(getattr(v, "getAdapter", None))
+                )
+            except:
+                return False
+
+        for field_name in ("chatListView", "chatListRecyclerView", "chatList", "messagesListView", "recyclerView"):
+            try:
+                candidate = get_private_field(chat_activity, field_name)
+                if _looks_like_chat_list_view(candidate):
+                    return candidate
+            except:
+                pass
+        return None
+
+    def _bulletin_fragment(self):
+        try:
+            return get_last_fragment()
+        except:
+            return None
+
+    def _add_log(self, message: str):
+        now = int(System.currentTimeMillis())
+        self._log_events.append(f"[{now}] {message}")
+        if len(self._log_events) > self._log_max_entries:
+            self._log_events = self._log_events[-self._log_max_entries:]
+
+    # ------------------------------------------------------------
+    # Настройки (с безопасными диалогами)
+    # ------------------------------------------------------------
+    def create_settings(self):
+        items = []
+
+        items.append(Header(text="SmartOptimizer v" + __version__))
+        if self._engine_initialized:
+            items.append(Text(text="Статус: активен", subtext="Хук чата + профайлер плагинов", icon="check"))
+        else:
+            items.append(Text(text="Статус: неактивен", subtext="Хуки не установлены", icon="close"))
+
+        items.append(Divider())
+        items.append(Header(text="🔥 Нагружающие плагины"))
+        if self._plugin_stats:
+            sorted_plugins = sorted(self._plugin_stats.items(),
+                                    key=lambda x: -x[1]["max"])[:5]
+            for name, p in sorted_plugins:
+                avg = p["total"] / p["calls"] if p["calls"] > 0 else 0
+                icon = "warning" if p["max"] > 30 else "check"
+                items.append(Text(
+                    text=name,
+                    subtext=f"avg: {avg:.1f}ms | max: {p['max']:.1f}ms | calls: {p['calls']}",
+                    icon=icon
+                ))
+        else:
+            items.append(Text(text="Нет данных", subtext="Ожидайте выполнения плагинов", icon="info"))
+
+        items.append(Divider())
+        mem_str = self._get_memory_info_str()
+        heap = self._heap_ratio_sample()
+        heap_pct = int(heap * 100)
+        heap_status = "Проблема" if heap > 0.80 else "Внимание" if heap > 0.60 else "ОК"
+        items.append(Text(text="Память", subtext=f"{heap_status} ({heap_pct}%)\n{mem_str}", icon="memory"))
+
+        cache_target = self._effective_item_view_cache_target()
+        items.append(Text(text="Рекомендованный кэш", subtext=str(cache_target), icon="cache"))
+        items.append(Text(text="Срабатываний оптимизации", subtext=str(self._optimization_count), icon="counter"))
+
+        items.append(Divider())
+        items.append(Text(text="FPS", subtext=f"{self._fps_current} (дропов: {self._fps_drops})", icon="msg_speed"))
+
+        items.append(Divider())
+        lag_val = self.get_setting("lag_threshold_ms")
+        items.append(Text(
+            text="Порог лага (ms)",
+            subtext=f"Текущее: {lag_val} ms · 16ms = 60 FPS",
+            icon="msg_speed",
+            on_click=lambda v: self._show_threshold_dialog(
+                "lag_threshold_ms", "Порог лага (ms)", self.THRESHOLD_OPTIONS_LAG
+            )
+        ))
+        warn_val = self.get_setting("warn_threshold_ms")
+        items.append(Text(
+            text="Порог предупреждения (ms)",
+            subtext=f"Текущее: {warn_val} ms · Выше — уведомление",
+            icon="msg_warning",
+            on_click=lambda v: self._show_threshold_dialog(
+                "warn_threshold_ms", "Порог предупреждения (ms)", self.THRESHOLD_OPTIONS_WARN
+            )
+        ))
+        auto_val = self.get_setting("auto_disable_ms")
+        items.append(Text(
+            text="Авто-отключение (ms)",
+            subtext=f"Текущее: {auto_val} ms · Только при авто-оптимизации",
+            icon="msg_block",
+            on_click=lambda v: self._show_threshold_dialog(
+                "auto_disable_ms", "Авто-отключение (ms)", self.THRESHOLD_OPTIONS_AUTO
+            )
+        ))
+
+        items.append(Divider())
+        items.append(Switch(
+            key="toast_on_lag",
+            text="Уведомления при лагах",
+            subtext="Всплывающее сообщение при превышении порога",
+            default=True,
+            icon="msg_notifications"
+        ))
+        items.append(Switch(
+            key="auto_optimize",
+            text="Авто-оптимизация",
+            subtext="Отключать плагины с критическим лагом",
+            default=False,
+            icon="msg_autonight"
+        ))
+        items.append(Switch(
+            key="fps_monitor",
+            text="Монитор FPS",
+            subtext="Отслеживать частоту кадров",
+            default=True,
+            icon="msg_performance"
+        ))
+
+        items.append(Divider())
+        items.append(Text(
+            text="Сбросить статистику",
+            subtext="Обнулить счётчики и очистить журнал",
+            icon="msg_delete",
+            on_click=lambda v: self._reset_stats()
+        ))
+        items.append(Text(
+            text="Показать журнал",
+            subtext="Последние 20 событий",
+            icon="msg_log",
+            on_click=lambda v: self._show_log()
+        ))
+
+        items.append(Divider())
+        items.append(Header(text="Последние события"))
+        if self._log_events:
+            for entry in self._log_events[-5:]:
+                items.append(Text(text=entry, icon="event"))
+        else:
+            items.append(Text(text="Событий пока нет", icon="event"))
+
+        return items
+
+    # ------------------------------------------------------------
+    # Безопасные диалоги
+    # ------------------------------------------------------------
+    def _show_threshold_dialog(self, setting_key, title, options):
+        fragment = self._bulletin_fragment()
+        if not fragment or not fragment.isAdded():
+            return
+        activity = fragment.getParentActivity()
+        if not activity:
+            return
+
+        current_val = self.get_setting(setting_key)
+        # Преобразуем список в массив строк
+        option_strings = []
+        for opt in options:
+            prefix = "✓ " if opt == current_val else "   "
+            option_strings.append(prefix + str(opt) + " ms")
+        option_array = option_strings  # пока список, но AlertDialogBuilder ожидает массив
+
+        def on_select(dialog, which):
+            dialog.dismiss()
+            selected = options[which]
+            self.set_setting(setting_key, selected, reload_settings=True)
+            BulletinHelper.show_success(title + " = " + str(selected) + " ms", fragment)
+
+        builder = AlertDialogBuilder(activity)
+        builder.set_title(title)
+        # Некоторые реализации требуют массив, другие принимают список – безопаснее передать массив
+        builder.set_items(option_array if isinstance(option_array, list) else option_array, on_select)
+        builder.set_negative_button("Отмена", lambda d, w: d.dismiss())
+        try:
+            builder.show()
+        except Exception as e:
+            self.log("Dialog show error: " + str(e))
+
+    def _reset_stats(self):
+        self._optimization_count = 0
+        self._last_opt_msg = "---"
+        self._last_opt_time_ms = 0
+        self._plugin_stats.clear()
+        self._fps_drops = 0
+        self._log_events.clear()
+        self.set_setting("_refresh_trigger", System.currentTimeMillis(), reload_settings=True)
+        BulletinHelper.show_success("Статистика сброшена", self._bulletin_fragment())
+
+    def _show_log(self):
+        fragment = self._bulletin_fragment()
+        if not fragment or not fragment.isAdded():
+            return
+        activity = fragment.getParentActivity()
+        if not activity:
+            return
+
+        entries = self._log_events[-20:]
+        message = "\n".join(entries) if entries else "Журнал пуст"
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("Журнал событий")
+        builder.set_message(message)
+        builder.set_negative_button("Закрыть", lambda d, w: d.dismiss())
+        try:
+            builder.show()
+        except Exception as e:
+            self.log("Dialog show error: " + str(e))

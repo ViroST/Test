@@ -1,0 +1,570 @@
+from base_plugin import BasePlugin
+from client_utils import get_last_fragment
+from hook_utils import find_class, get_private_field, get_static_private_field
+from android_utils import run_on_ui_thread
+from ui.settings import Header, Divider, Switch
+from java import jclass
+from java.util import Locale
+from android.view import View
+
+__id__ = "hide_tabs"
+__name__ = "Hide Tabs"
+__description__ = "Скрывает вкладки Контакты и/или Настройки на главном экране."
+__author__ = "@sokolovskybio"
+__version__ = "2.0"
+__icon__ = "kittycatee/4"
+__min_version__ = "12.4.1"
+
+
+class _L:
+    _lang = Locale.getDefault().getLanguage()
+    _ru = {
+        "hdr":        "Скрыть вкладки",
+        "contacts":   "Скрыть Контакты",
+        "contacts_d": "Убирает вкладку «Контакты» с главного экрана",
+        "settings":   "Скрыть Настройки",
+        "settings_d": "Убирает вкладку «Настройки» с главного экрана",
+        "note":       "Изменения применяются мгновенно, без перезапуска",
+    }
+    _en = {
+        "hdr":        "Hide tabs",
+        "contacts":   "Hide Contacts",
+        "contacts_d": "Removes the Contacts tab from the main screen",
+        "settings":   "Hide Settings",
+        "settings_d": "Removes the Settings tab from the main screen",
+        "note":       "Changes apply instantly, no restart needed",
+    }
+
+    @classmethod
+    def get(cls, key):
+        d = cls._ru if cls._lang == "ru" else cls._en
+        return d.get(key, key)
+
+
+class HideTabsPlugin(BasePlugin):
+    _MAIN_TABS_CLASS_NAME = "org.telegram.ui.MainTabsActivity"
+
+    _POS_CHATS    = 0
+    _POS_CONTACTS = 1
+    _POS_SETTINGS = 2
+    _POS_PROFILE  = 3
+
+    def __init__(self):
+        super().__init__()
+        self._hook_create_view_ref    = None
+        self._hook_resume_ref         = None
+        self._hook_can_scroll_fwd_ref = None
+        self._hook_can_scroll_bwd_ref = None
+        self._main_tabs_class         = None
+        self._context_class           = None
+        self._contacts_index          = None
+        self._settings_index          = None
+        self._profile_index           = None
+
+
+    def on_plugin_load(self):
+        self._warmup_reflection_cache()
+        self._hook_main_tabs_create_view()
+        self._hook_main_tabs_resume()
+        self._hook_main_tabs_can_scroll()
+        run_on_ui_thread(self._apply_to_current_fragment)
+
+    def on_plugin_unload(self):
+        for ref_name in (
+            "_hook_create_view_ref",
+            "_hook_resume_ref",
+            "_hook_can_scroll_fwd_ref",
+            "_hook_can_scroll_bwd_ref",
+        ):
+            ref = getattr(self, ref_name, None)
+            if ref is not None:
+                try:
+                    self.unhook_method(ref)
+                except Exception:
+                    pass
+            setattr(self, ref_name, None)
+
+
+    def create_settings(self):
+        return [
+            Header(text=_L.get("hdr")),
+            Switch(
+                key="hide_contacts",
+                text=_L.get("contacts"),
+                subtext=_L.get("contacts_d"),
+                icon="msg_contacts",
+                default=False,
+                on_change=lambda _v: run_on_ui_thread(self._apply_to_current_fragment),
+            ),
+            Switch(
+                key="hide_settings",
+                text=_L.get("settings"),
+                subtext=_L.get("settings_d"),
+                icon="msg_settings_14",
+                default=False,
+                on_change=lambda _v: run_on_ui_thread(self._apply_to_current_fragment),
+            ),
+            Divider(text=_L.get("note")),
+        ]
+
+
+    def _apply_to_current_fragment(self):
+        fragment = None
+        try:
+            fragment = get_last_fragment()
+        except Exception:
+            pass
+        self._apply_to_activity_if_main_tabs(fragment)
+
+    def _apply_to_activity_if_main_tabs(self, activity):
+        if not self._is_main_tabs_activity(activity):
+            return
+        self._apply_visibility(activity)
+        self._normalize_position(activity)
+
+    def _apply_visibility(self, activity):
+        tabs      = self._get_tabs(activity)
+        tabs_view = self._get_tabs_view(activity)
+        if tabs is None or tabs_view is None:
+            return
+
+        hide_contacts = bool(self.get_setting("hide_contacts", False))
+        hide_settings = bool(self.get_setting("hide_settings", False))
+
+        self._set_tab_visible(tabs, tabs_view, self._get_contacts_index(), not hide_contacts)
+        self._set_tab_visible(tabs, tabs_view, self._get_settings_index(), not hide_settings)
+
+    def _set_tab_visible(self, tabs, tabs_view, index, visible):
+        tab = self._safe_array_get(tabs, index)
+        if tab is None:
+            return
+        try:
+            if hasattr(tabs_view, "isViewVisible"):
+                currently = bool(tabs_view.isViewVisible(tab))
+                if currently == visible:
+                    return
+        except Exception:
+            pass
+        try:
+            tabs_view.setViewVisible(tab, visible, False)
+            return
+        except Exception:
+            pass
+        try:
+            if visible:
+                tab.setVisibility(View.VISIBLE)
+                tab.setClickable(True)
+                tab.setEnabled(True)
+            else:
+                tab.setVisibility(View.GONE)
+                tab.setClickable(False)
+                tab.setEnabled(False)
+        except Exception:
+            pass
+
+    def _normalize_position(self, activity):
+        """Если пользователь стоит на только что скрытой вкладке — отправить на Чаты."""
+        current = self._get_current_position(activity)
+        if current is None:
+            return
+        hide_contacts = bool(self.get_setting("hide_contacts", False))
+        hide_settings = bool(self.get_setting("hide_settings", False))
+        if (current == self._get_contacts_index() and hide_contacts) or \
+           (current == self._get_settings_index() and hide_settings):
+            self._scroll_to_position(activity, self._POS_CHATS)
+
+
+    def _on_can_scroll_decision(self, activity, forward, original_result):
+        if not self._is_main_tabs_activity(activity):
+            return None
+        if not self._is_scroll_allowed(original_result):
+            return None
+
+        current = self._get_current_position(activity)
+        if current is None:
+            return None
+
+        hide_contacts = bool(self.get_setting("hide_contacts", False))
+        hide_settings = bool(self.get_setting("hide_settings", False))
+
+        if not hide_contacts and not hide_settings:
+            return None
+
+        visible = [self._POS_CHATS]
+        if not hide_contacts:
+            visible.append(self._get_contacts_index())
+        if not hide_settings:
+            visible.append(self._get_settings_index())
+        visible.append(self._get_profile_index())
+
+        if current not in visible:
+            return None
+
+        idx = visible.index(current)
+
+        if forward and idx < len(visible) - 1:
+            nxt = visible[idx + 1]
+            if nxt != current + 1:
+                if self._scroll_to_position(activity, nxt):
+                    return False
+
+        elif not forward and idx > 0:
+            prv = visible[idx - 1]
+            if prv != current - 1:
+                if self._scroll_to_position(activity, prv):
+                    return False
+
+        return None
+
+    def _is_scroll_allowed(self, result):
+        if result is None:
+            return False
+        try:
+            return bool(result.booleanValue())
+        except Exception:
+            pass
+        try:
+            return bool(result)
+        except Exception:
+            return False
+
+    def _hook_main_tabs_create_view(self):
+        if self._hook_create_view_ref is not None:
+            return
+        cls = self._get_main_tabs_class()
+        if cls is None:
+            return
+        method = self._find_create_view_method(cls)
+        if method is None:
+            return
+        try:
+            self._hook_create_view_ref = self.hook_method(method, _CreateViewHook(self))
+        except Exception as e:
+            self._safe_log(f"[HideTabs] createView hook failed: {e}")
+
+    def _hook_main_tabs_resume(self):
+        if self._hook_resume_ref is not None:
+            return
+        cls = self._get_main_tabs_class()
+        if cls is None:
+            return
+        method = self._find_method_by_name_and_count(cls, "onResume", 0)
+        if method is None:
+            return
+        try:
+            self._hook_resume_ref = self.hook_method(method, _ResumeHook(self))
+        except Exception as e:
+            self._safe_log(f"[HideTabs] onResume hook failed: {e}")
+
+    def _hook_main_tabs_can_scroll(self):
+        cls = self._get_main_tabs_class()
+        if cls is None:
+            return
+
+        fwd_method  = self._find_method_by_name_and_count(cls, "canScrollForward", 1)
+        bwd_method  = self._find_method_by_name_and_count(cls, "canScrollBackward", 1)
+        int_method  = None
+        if fwd_method is None or bwd_method is None:
+            int_method = self._find_method_by_name_and_count(cls, "canScrollInternal", 2)
+
+        if fwd_method is None and bwd_method is None and int_method is not None:
+            if self._hook_can_scroll_fwd_ref is None:
+                try:
+                    self._hook_can_scroll_fwd_ref = self.hook_method(
+                        int_method, _CanScrollHook(self, True, "internal"))
+                except Exception as e:
+                    self._safe_log(f"[HideTabs] canScrollInternal hook failed: {e}")
+            return
+
+        if self._hook_can_scroll_fwd_ref is None:
+            target = fwd_method or int_method
+            if target is not None:
+                mode = "forward" if self._method_name(target) == "canScrollForward" else "internal"
+                try:
+                    self._hook_can_scroll_fwd_ref = self.hook_method(
+                        target, _CanScrollHook(self, True, mode))
+                except Exception as e:
+                    self._safe_log(f"[HideTabs] canScrollForward hook failed: {e}")
+
+        if self._hook_can_scroll_bwd_ref is None:
+            target = bwd_method or int_method
+            if target is not None and not self._same_method(fwd_method, target):
+                mode = "backward" if self._method_name(target) == "canScrollBackward" else "internal"
+                try:
+                    self._hook_can_scroll_bwd_ref = self.hook_method(
+                        target, _CanScrollHook(self, False, mode))
+                except Exception as e:
+                    self._safe_log(f"[HideTabs] canScrollBackward hook failed: {e}")
+
+
+    def _warmup_reflection_cache(self):
+        self._main_tabs_class = self._get_main_tabs_class()
+        self._context_class   = self._get_context_class()
+        self._contacts_index  = self._resolve_index("INDEX_CONTACTS", self._POS_CONTACTS)
+        self._settings_index  = self._resolve_index("INDEX_SETTINGS", self._POS_SETTINGS)
+        self._profile_index   = self._resolve_index("INDEX_PROFILE",  self._POS_PROFILE)
+
+    def _resolve_index(self, field_name, fallback):
+        cls = self._get_main_tabs_class()
+        if cls is not None:
+            try:
+                value = get_static_private_field(cls, field_name)
+                if value is not None:
+                    return int(value)
+            except Exception:
+                pass
+        return fallback
+
+    def _get_contacts_index(self):
+        if self._contacts_index is None:
+            self._contacts_index = self._resolve_index("INDEX_CONTACTS", self._POS_CONTACTS)
+        return self._contacts_index
+
+    def _get_settings_index(self):
+        if self._settings_index is None:
+            self._settings_index = self._resolve_index("INDEX_SETTINGS", self._POS_SETTINGS)
+        return self._settings_index
+
+    def _get_profile_index(self):
+        if self._profile_index is None:
+            self._profile_index = self._resolve_index("INDEX_PROFILE", self._POS_PROFILE)
+        return self._profile_index
+
+
+    def _get_current_position(self, activity):
+        vp = self._get_view_pager(activity)
+        if vp is None:
+            return None
+        try:
+            return int(vp.getCurrentPosition())
+        except Exception:
+            return None
+
+    def _scroll_to_position(self, activity, target):
+        vp = self._get_view_pager(activity)
+        if vp is None:
+            return False
+        try:
+            if int(vp.getCurrentPosition()) == int(target):
+                return True
+        except Exception:
+            pass
+        try:
+            vp.scrollToPosition(int(target))
+        except Exception:
+            return False
+        try:
+            activity.selectTab(int(target), True)
+        except Exception:
+            pass
+        return True
+
+    def _get_view_pager(self, activity):
+        for getter in (lambda: getattr(activity, "viewPager", None),
+                       lambda: get_private_field(activity, "viewPager")):
+            try:
+                v = getter()
+                if v is not None:
+                    return v
+            except Exception:
+                pass
+        return None
+
+    def _get_tabs(self, activity):
+        for getter in (lambda: getattr(activity, "tabs", None),
+                       lambda: get_private_field(activity, "tabs")):
+            try:
+                v = getter()
+                if v is not None:
+                    return v
+            except Exception:
+                pass
+        return None
+
+    def _get_tabs_view(self, activity):
+        try:
+            return get_private_field(activity, "tabsView")
+        except Exception:
+            return None
+
+    def _get_main_tabs_class(self):
+        if self._main_tabs_class is not None:
+            return self._main_tabs_class
+        try:
+            self._main_tabs_class = find_class(self._MAIN_TABS_CLASS_NAME)
+        except Exception:
+            self._main_tabs_class = None
+        return self._main_tabs_class
+
+    def _get_context_class(self):
+        if self._context_class is not None:
+            return self._context_class
+        for loader in (lambda: find_class("android.content.Context"),
+                       lambda: jclass("android.content.Context")):
+            try:
+                cls = loader()
+                if cls is not None:
+                    self._context_class = cls
+                    return cls
+            except Exception:
+                pass
+        return None
+
+    def _is_main_tabs_activity(self, obj):
+        if obj is None:
+            return False
+        try:
+            return obj.getClass().getName() == self._MAIN_TABS_CLASS_NAME
+        except Exception:
+            return False
+
+    def _find_create_view_method(self, cls):
+        ctx = self._get_context_class()
+        if ctx is not None:
+            for param in (ctx, self._safe_get_class(ctx)):
+                if param is None:
+                    continue
+                m = self._try_declared_method(cls, "createView", param)
+                if m is not None:
+                    return m
+        return self._find_method_by_name_and_count(cls, "createView", 1)
+
+    def _try_declared_method(self, cls, method_name, *params):
+        for owner in self._owner_hierarchy(cls):
+            for target in (owner, self._safe_get_class(owner)):
+                if target is None:
+                    continue
+                try:
+                    m = target.getDeclaredMethod(method_name, *params)
+                    m.setAccessible(True)
+                    return m
+                except Exception:
+                    pass
+        return None
+
+    def _find_method_by_name_and_count(self, cls, method_name, param_count):
+        for owner in self._owner_hierarchy(cls):
+            for target in (owner, self._safe_get_class(owner)):
+                if target is None:
+                    continue
+                try:
+                    methods = target.getDeclaredMethods()
+                except Exception:
+                    continue
+                for m in methods:
+                    try:
+                        if m.getName() == method_name and \
+                                len(m.getParameterTypes()) == param_count:
+                            m.setAccessible(True)
+                            return m
+                    except Exception:
+                        pass
+        return None
+
+    def _owner_hierarchy(self, cls):
+        owners, seen = [], set()
+        for start in (cls, self._safe_get_class(cls)):
+            current = start
+            while current is not None:
+                key = str(current)
+                if key in seen:
+                    break
+                seen.add(key)
+                owners.append(current)
+                try:
+                    current = current.getSuperclass()
+                except Exception:
+                    break
+        return owners
+
+    def _safe_get_class(self, obj):
+        if obj is None:
+            return None
+        try:
+            return obj.getClass()
+        except Exception:
+            return None
+
+    def _safe_array_get(self, arr, index):
+        for getter in (lambda: arr[index], lambda: arr.get(index)):
+            try:
+                v = getter()
+                if v is not None:
+                    return v
+            except Exception:
+                pass
+        return None
+
+    def _method_name(self, method):
+        try:
+            return str(method.getName())
+        except Exception:
+            return ""
+
+    def _same_method(self, m1, m2):
+        if m1 is None or m2 is None:
+            return False
+        try:
+            return str(m1) == str(m2)
+        except Exception:
+            return m1 is m2
+
+    def _safe_log(self, text):
+        try:
+            self.log(text)
+        except Exception:
+            pass
+
+
+class _CreateViewHook:
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            self.plugin._apply_to_activity_if_main_tabs(param.thisObject)
+        except Exception:
+            pass
+
+
+class _ResumeHook:
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            self.plugin._apply_to_activity_if_main_tabs(param.thisObject)
+        except Exception:
+            pass
+
+
+class _CanScrollHook:
+    def __init__(self, plugin, forward, mode):
+        self.plugin  = plugin
+        self.forward = bool(forward)
+        self.mode    = mode
+
+    def after_hooked_method(self, param):
+        try:
+            forward = self.forward
+            if self.mode == "forward":
+                forward = True
+            elif self.mode == "backward":
+                forward = False
+            elif self.mode == "internal":
+                try:
+                    if param.args is not None and len(param.args) >= 2:
+                        forward = bool(param.args[1])
+                except Exception:
+                    pass
+
+            new_result = self.plugin._on_can_scroll_decision(
+                param.thisObject, forward, param.getResult())
+            if new_result is None:
+                return
+            try:
+                param.setResult(bool(new_result))
+            except Exception:
+                param.result = bool(new_result)
+        except Exception:
+            pass

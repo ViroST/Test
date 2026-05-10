@@ -1,0 +1,249 @@
+from base_plugin import BasePlugin, MenuItemData, MenuItemType, HookResult, HookStrategy
+from android_utils import run_on_ui_thread, log
+from client_utils import get_last_fragment
+from hook_utils import find_class, get_private_field, set_private_field
+from org.telegram.messenger import AndroidUtilities, MessageObject
+from org.telegram.ui.ActionBar import Theme
+from android.widget import TextView, ScrollView, FrameLayout
+from android.view import Gravity, View
+from ui.settings import Header, Switch
+from ui.alert import AlertDialogBuilder
+
+__id__ = "message_viewer_ecubz"
+__name__ = "Message Viewer"
+__description__ = """RU: Просмотр сообщения в отдельном окне для удобного выделения, копирования и цитирования.
+Зажмите сообщение -> Плагины -> Просмотреть полностью.
+Выделите нужный фрагмент и нажмите "Цитировать" - он прикрепится как цитата к ответу.
+Поддержка сырого MD-текста и переключение режимов прямо в окне.
+EN: View message in a separate window for easy selection, copying and quoting.
+Long press message -> Plugins -> View full.
+Select text and tap "Quote" to attach it as a quote reply.
+Supports raw MD text display with in-dialog mode switching."""
+__version__ = "1.3.0"
+__author__ = "eCubz"
+__icon__ = "eCubzPlugin/2"
+
+ENTITY_MAP = {
+    "messageEntityBold": ("**", "**"),
+    "messageEntityItalic": ("__", "__"),
+    "messageEntityStrike": ("~~", "~~"),
+    "messageEntityCode": ("`", "`"),
+    "messageEntityPre": ("```\n", "\n```"),
+    "messageEntityUnderline": ("++", "++"),
+    "messageEntitySpoiler": ("||", "||"),
+    "messageEntityTextUrl": ("[", "]({url})"),
+}
+
+def _utf16_map(text):
+    table = {}
+    u16 = 0
+    for i, ch in enumerate(text):
+        table[u16] = i
+        u16 += 2 if ord(ch) > 0xFFFF else 1
+    table[u16] = len(text)
+    return table
+
+def _entities_to_markdown(msg_owner):
+    text = str(msg_owner.message or "")
+    if not text:
+        return ""
+    ents = None
+    try:
+        ents = msg_owner.entities
+    except:
+        pass
+    if not ents or ents.size() == 0:
+        return text
+
+    u16map = _utf16_map(text)
+    opens = {}
+    closes = {}
+    for idx in range(ents.size()):
+        e = ents.get(idx)
+        cls_name = ""
+        try:
+            cls_name = e.getClass().getSimpleName()
+        except:
+            continue
+        low = cls_name[0].lower() + cls_name[1:] if cls_name else ""
+        mapping = None
+        for key in ENTITY_MAP:
+            if key.lower() in low.lower():
+                mapping = ENTITY_MAP[key]
+                break
+        if not mapping:
+            continue
+        u16_off = int(e.offset)
+        u16_len = int(e.length)
+        prefix = mapping[0]
+        suffix = mapping[1]
+        if "{url}" in suffix:
+            url = ""
+            try:
+                url = str(e.url or "")
+            except:
+                pass
+            suffix = suffix.replace("{url}", url)
+        py_start = u16map.get(u16_off, u16_off)
+        py_end = u16map.get(u16_off + u16_len, u16_off + u16_len)
+        opens.setdefault(py_start, []).append((u16_len, idx, prefix))
+        closes.setdefault(py_end, []).append((u16_len, idx, suffix))
+
+    parts = []
+    for i in range(len(text) + 1):
+        if i in closes:
+            for _, _, suffix in sorted(closes[i], key=lambda x: (x[0], -x[1])):
+                parts.append(suffix)
+        if i in opens:
+            for _, _, prefix in sorted(opens[i], key=lambda x: (-x[0], x[1])):
+                parts.append(prefix)
+        if i < len(text):
+            parts.append(text[i])
+    return "".join(parts)
+
+class MessageViewerPlugin(BasePlugin):
+
+    def on_plugin_load(self):
+        self._menu_item_id = self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
+            text="Просмотреть полностью",
+            icon="msg_info",
+            on_click=self._on_view_message_click,
+            condition="message != null",
+            priority=100
+        ))
+
+    def on_plugin_unload(self):
+        if hasattr(self, "_menu_item_id"):
+            self.remove_menu_item(self._menu_item_id)
+
+    def _on_view_message_click(self, context):
+        message_obj = context.get("message")
+        if not message_obj:
+            return
+        run_on_ui_thread(lambda: self._show_message_dialog(message_obj, False))
+
+    def _find_album_caption_msg(self, message_obj, fragment):
+        try:
+            grouped_id = message_obj.messageOwner.grouped_id
+            if not grouped_id or grouped_id == 0:
+                return None
+            messages = get_private_field(fragment, "messages")
+            if not messages:
+                return None
+            for i in range(messages.size()):
+                msg = messages.get(i)
+                if not msg or not msg.messageOwner:
+                    continue
+                if msg.messageOwner.grouped_id != grouped_id:
+                    continue
+                raw_text = msg.messageOwner.message
+                if raw_text and str(raw_text).strip():
+                    return msg
+        except:
+            pass
+        return None
+
+    def _extract_text(self, message_obj, fragment, show_formatted):
+        effective = self._find_album_caption_msg(message_obj, fragment) or message_obj
+        if show_formatted:
+            text = effective.caption
+            if not text:
+                text = effective.messageText
+            if not text and effective.messageOwner:
+                text = effective.messageOwner.message
+        else:
+            if effective.messageOwner:
+                text = _entities_to_markdown(effective.messageOwner)
+            else:
+                text = ""
+        return text if text else ""
+
+    def _show_message_dialog(self, message_obj, show_formatted):
+        fragment = get_last_fragment()
+        if not fragment:
+            return
+        context = fragment.getParentActivity()
+        if not context:
+            return
+
+        text = self._extract_text(message_obj, fragment, show_formatted)
+        if show_formatted:
+            title = "Просмотр (форматированный)"
+            switch_label = "Сырой текст"
+        else:
+            title = "Просмотр (сырой MD)"
+            switch_label = "Форматированный"
+
+        container = FrameLayout(context)
+        scroll_view = ScrollView(context)
+        scroll_view.setPadding(
+            AndroidUtilities.dp(20), AndroidUtilities.dp(10),
+            AndroidUtilities.dp(20), AndroidUtilities.dp(10)
+        )
+        text_view = TextView(context)
+        text_view.setTextSize(1, 16)
+        text_view.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+        text_view.setTextIsSelectable(True)
+        text_view.setText(text)
+
+        params_tv = FrameLayout.LayoutParams(-1, -2)
+        scroll_view.addView(text_view, params_tv)
+        params_sv = FrameLayout.LayoutParams(-1, -1)
+        container.addView(scroll_view, params_sv)
+
+        builder = AlertDialogBuilder(context)
+        builder.set_title(title)
+        builder.set_view(container)
+
+        def on_quote(dialog, which):
+            sel_s = text_view.getSelectionStart()
+            sel_e = text_view.getSelectionEnd()
+            full = text_view.getText()
+            selected = ""
+            if sel_s >= 0 and sel_e >= 0 and sel_s != sel_e:
+                s = min(sel_s, sel_e)
+                e = max(sel_s, sel_e)
+                selected = str(full.subSequence(s, e))
+            self._apply_quote(fragment, message_obj, selected)
+
+        def on_switch(dialog, which):
+            try:
+                dialog.dismiss()
+            except:
+                pass
+            run_on_ui_thread(lambda: self._show_message_dialog(message_obj, not show_formatted))
+
+        builder.set_positive_button("Цитировать", on_quote)
+        builder.set_neutral_button(switch_label, on_switch)
+        builder.set_negative_button("Закрыть", None)
+        builder.show()
+
+    def _apply_quote(self, fragment, message_obj, quote_text):
+        try:
+            if quote_text and len(quote_text.strip()) > 0:
+                ReplyQuote = find_class("org.telegram.ui.ChatActivity$ReplyQuote")
+                from java.lang import String as JString
+                quote = getattr(ReplyQuote, "from")(message_obj, JString(quote_text), 0)
+                if quote:
+                    fragment.showFieldPanelForReplyQuote(message_obj, quote)
+                    return
+            fragment.showFieldPanelForReplyQuote(message_obj, None)
+        except Exception as e:
+            log(f"[MessageViewer] Quote error: {e}")
+            try:
+                fragment.showFieldReply(message_obj)
+            except:
+                pass
+
+    def create_settings(self):
+        return [
+            Header(text="Message Viewer"),
+            Switch(
+                key="open_formatted",
+                text="Форматированный по умолчанию",
+                default=False,
+                icon="msg_text",
+                on_change=lambda val: self.set_setting("open_formatted", val)
+            )
+        ]

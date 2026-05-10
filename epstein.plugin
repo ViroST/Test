@@ -1,0 +1,50 @@
+from android_utils import log
+from android.widget import TextView
+from java.lang import CharSequence, String, Integer
+from org.telegram.messenger import LocaleController
+from base_plugin import BasePlugin, HookResult, HookStrategy
+from typing import Any
+import random
+
+__id__ = "epstein"
+__name__ = "Эпштейниум"
+__description__ = "скачат файл эпштейн"
+__author__ = "@keynet_py"
+__min_version__ = "11.9.0"
+__version__ = "⬛⬛⬛"
+__icon__ = "ExterapluginsBot/2"
+
+class Epstein(BasePlugin):
+
+    def on_plugin_load(self):
+        # Хук для замены текста в отправляемых сообщениях
+        self.add_on_send_message_hook()
+        log("EPSTEIN остров подключен")
+
+    def replace_with_probably(self, text_array):
+        result = []
+        for word in text_array:
+            if random.random() < 0.5:
+                replaced_word = '⬛' * len(word)
+                result.append(replaced_word)
+            else:
+                result.append(word)
+        return " ".join(result)
+
+    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
+        try:
+            if params.message:
+                original_message = params.message.split(" ")
+                modified_message = self.replace_with_probably(original_message)
+                
+                if modified_message != original_message:
+                    params.message = modified_message
+                    log(f"Сообщение изменено: '{original_message}' -> '{modified_message}'")
+                    return HookResult(strategy=HookStrategy.MODIFY, params=params)
+            return HookResult()
+        except Exception as e:
+            log(f"Произошла ошибка в on_send_message_hook: {e}")
+            return HookResult()
+
+    def on_plugin_unload(self):
+        log("EPSTEIN вышел")
